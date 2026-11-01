@@ -2421,6 +2421,25 @@ func (c *Client) ModelRate(realm, model string) string {
 	return c.modelRates[realmKey(realm)][model]
 }
 
+// ModelRatesSnapshot 返回指定域模型倍率快照副本；空表示未知/尚未刷新过目录。
+// 供只读聚合端点一次取整张倍率表（ModelRate 是单模型查询，逐个取要反复拿锁）。
+func (c *Client) ModelRatesSnapshot(realm string) map[string]string {
+	if c == nil {
+		return nil
+	}
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+	bucket := c.modelRates[realmKey(realm)]
+	if len(bucket) == 0 {
+		return nil
+	}
+	cp := make(map[string]string, len(bucket))
+	for k, v := range bucket {
+		cp[k] = v
+	}
+	return cp
+}
+
 // GlobalEffortSnapshot 导出 global 域 effort 能力缓存（探测下发 ∪ 静态兜底合并后的桶），
 // 供 /v1/models 输出 reasoning_supported_efforts / reasoning_default_effort。
 // 返回副本；桶未填充（无 global 账号或从未探测）→ nil（调用方回落静态兜底表）。

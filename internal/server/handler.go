@@ -231,6 +231,8 @@ func NewHandler(cfg Config) *Handler {
 	// OpenAI 系客户端用 Bearer，两种携带方式都必须放行（见 withDualAuth）。
 	h.mux.HandleFunc("GET /v1/models", h.withDualAuth(h.models))
 	h.mux.HandleFunc("GET /v1/capacity", h.withAuth(h.capacity))
+	// 只读聚合：各域剩余积分 × 模型倍率（升序） × 限流画像，一次拉齐分派决策所需的账面信息。
+	h.mux.HandleFunc("GET /v1/credit_status", h.withAuth(h.creditStatus))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
