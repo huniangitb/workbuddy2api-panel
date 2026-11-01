@@ -370,18 +370,35 @@ function disabledAge(at) {
   return Math.floor(sec / 86400) + ' 天前';
 }
 
-function rateLimitRowsHtml(rows, now) {
+/* fallbackTargetFor 查该 (域, 模型) 配置的降级/兜底目标（未配置 → 空串）。
+   两张表都认：pool.model_fallback（6004 限流改道）与 pool.model_unavailable_fallback
+   （目录查无/全池 11102 转接）。键既可能是裸名，也可能带 cn:/global: 前缀——
+   配置端原样透传不做归一化，所以查找顺序必须与网关 lookupFallback 一致：
+   带域前缀的键优先，再回退裸名。只查裸名会让按域配置整表失效，账号池里就只剩
+   「限流中」而看不到「请求其实已经改道」（2026-10-31 用户反馈）。 */
+function fallbackTargetFor(model, realm) {
+  if (!model) return '';
+  const bare = String(model).replace(/^[a-z]+:/, '');
+  const tables = [
+    (overviewData && overviewData.model_fallback) || {},
+    (overviewData && overviewData.model_unavailable_fallback) || {},
+  ];
+  for (const t of tables) {
+    const hit = (realm ? t[realm + ':' + bare] : '') || t[model] || t[bare];
+    if (hit) return hit;
+  }
+  return '';
+}
+
+function rateLimitRowsHtml(rows, now, realm) {
   const list = Array.isArray(rows) ? rows.filter(row => row && row.model) : [];
   if (!list.length) return '';
-  // 降级路由表（overview 的 model_fallback）：限流的模型若配了等价模型，标注
-  // 「⤳ 已路由至 X」—— 否则用户看到「v4.1 限流」会以为服务断了，实际请求已被
-  // 自动改道到等价模型继续服务。这条是用户实测反馈要求可见的。
-  const fb = (overviewData && overviewData.model_fallback) || {};
+  // 降级路由表：限流的模型若配了等价模型，标注「⤳ 已路由至 X」—— 否则用户看到
+  // 「v4.1 限流」会以为服务断了，实际请求已被自动改道到等价模型继续服务。
+  // 这条是用户实测反馈要求可见的。
   return '<div class="rate-limits">' + list.map(row => {
     const m = rateLimitMeta(row, now);
-    // 双重查找：上游台账里的 model 可能带 realm 前缀（cn:x），配置里是裸名。
-    const bare = String(m.model || '').replace(/^[a-z]+:/, '');
-    const alt = fb[row.model] || fb[bare] || '';
+    const alt = fallbackTargetFor(row.model, realm || row.realm || '');
     const route = alt ? '<span class="fb">⤳ 已路由至 ' + esc(alt) + '</span>' : '';
     const title = alt ? m.title + '；已自动改道到 ' + alt : m.title;
     return '<div class="rate-limit ' + (m.kind === 'model_unavailable' ? 'model-unavailable' : '') +
@@ -559,7 +576,7 @@ function renderAccounts(list) {
         (dk && dk.action ? '<span>' + esc(dk.action) + '</span>' : '') +
         '<div style="margin-top:2px;opacity:.85">' + esc(s.reason) + '</div></div>'
       : '';
-    const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
+    const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now(), s.realm);
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
     // enterpriseUnlimitedTotal）。此时剩余额度不参与展示，直接标「不限」。
@@ -654,8 +671,14 @@ function renderModelLocks(rows) {
     const [cls, label] = ML_STATE[r.state] || ['', r.state || '—'];
     const unlock = r.unlock_at && !/^0001-/.test(r.unlock_at) ? fmtLocalDateTime(r.unlock_at) : '—';
     const fully = r.fully_unlock_at && !/^0001-/.test(r.fully_unlock_at) ? fmtLocalDateTime(r.fully_unlock_at) : '—';
+    // 「锁了但请求照样能过」是这张表最容易误读的地方：配了降级/兜底路由表时，该模型
+    // 在本域不可用，请求已被网关改道到等价模型继续服务。不标出来，运维会把
+    // 「global flash 锁定」直接读成「flash 服务中断」（2026-10-31 用户反馈）。
+    const alt = fallbackTargetFor(r.model, r.realm);
+    const route = alt ? '<div class="fb" title="该模型在本域不可用时，请求已自动改道到 ' +
+      esc(alt) + '">⤳ 已路由至 ' + esc(alt) + '</div>' : '';
     return '<tr>' +
-      '<td><b>' + esc(r.model) + '</b></td>' +
+      '<td><b>' + esc(r.model) + '</b>' + route + '</td>' +
       '<td>' + (r.realm === 'global' ? '国际版' : '国内版') + '</td>' +
       '<td><span class="tag ' + cls + '">' + label + '</span></td>' +
       '<td class="num">' + (r.servable || 0) + ' / ' + (r.total || 0) + '</td>' +
@@ -1020,7 +1043,11 @@ async function loadModels(force) {
     // 目录来源：桌面端族是官方 picker 口径；union/enterprise 说明 v3 探测部分或全部失败，
     // 拿到的是回落目录（数量偏少、倍率可能是旧值），必须在界面上说清楚。
     const srcNote = { 'v3-desktop': '', 'v3-union': ' · ⚠ 国际版目录来自回落（IDE+CLI 并集）', 'enterprise': ' · ⚠ 国际版目录已降级到企业端点（窄目录/旧倍率）' }[d.global_source] || '';
-    $('mdNote').textContent = mdAll.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '') + srcNote;
+    // 分域取数失败告警（fetch_errors，2026-10-25）：此前某域失败被后端静默吞掉——
+    // global 探测失败（如 DNS 抖动 → 5min 负缓存）时页面只剩 CN 模型，无从知道原因。
+    const errs = Array.isArray(d.fetch_errors) ? d.fetch_errors.filter(Boolean) : [];
+    const errNote = errs.length ? ' · ⚠ ' + errs.join('；') : '';
+    $('mdNote').textContent = mdAll.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '') + srcNote + errNote;
     renderModels();
   } catch (e) {
     mdAll = [];
@@ -1118,7 +1145,9 @@ function mdAvailabilityOf(m, locks, recent) {
     return { key: 'limited', label: '限流/不可用', cls: 'warn',
       tip: '模型级冷却中' + (reason ? '；' + reason : '') };
   }
-  const ev = recent.find(e => e && e.model === id);
+  // 同时匹配请求模型与降级后实际模型（model_eff）：请求 A 实际用 B 成功时，
+  // B 的「可用」标注也要由这条真实流量合成（2026-10-25 链路补齐）。
+  const ev = recent.find(e => e && (e.model === id || e.model_eff === id));
   if (ev) {
     const status = Number(ev.status || 0);
     const when = ev.time ? new Date(ev.time).toLocaleString('zh-CN', { hour12: false }) : '';
@@ -1297,18 +1326,18 @@ $('btnModels').onclick = () => loadModels(true);
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
 let logCh = 'all';
-// 运行日志的增量拉取状态（perf）：logRows 是本地窗口，logSeq 是下次增量的起点。
+// 运行日志的增量拉取状态（perf）：logRows 是本地窗口，logSinceTs 是下次增量的起点。
 // 常态每 5 秒只传新增行，不再每轮重拉 500 行（~90KB）并重建整块 DOM。
 // LOG_ROWS_MAX 与服务端环形缓冲同量级（500）——本地窗口不必更大。
 let logRows = [];
-let logSeq = 0;
-let logCursorAt = null;
+let logSinceTs = null;
+let logSince = '';
 const LOG_ROWS_MAX = 500;
 // 增量游标最长有效期：超过则改全量拉（服务端环形缓冲只有 500 行，久了会淘汰
 // 中间旧行，增量就拿不到「完整的一段」）。
 const LOG_CURSOR_MAX_AGE_MS = 5 * 60 * 1000;
 // resetLogWindow 丢弃本地窗口，下次改为全量拉（切视图/手动重载时用）。
-function resetLogWindow() { logRows = []; logSeq = 0; logCursorAt = null; }
+function resetLogWindow() { logRows = []; logSinceTs = null; logSince = ''; }
 $('logChips').addEventListener('click', ev => {
   const b = ev.target.closest('button[data-ch]');
   if (!b) return;
@@ -1346,10 +1375,10 @@ async function loadLogs() {
     // 例外：切走很久再回来时，服务端环形缓冲（500 行）可能已经把中间的旧行
     // 淘汰掉了——增量只会拿到「还在环里」的那部分，中间缺一段。因此游标超过
     // LOG_CURSOR_MAX_AGE_MS 就退回全量拉（一次 90KB，换来不缺行）。
-    if (logCursorAt && (Date.now() - logCursorAt.getTime()) > LOG_CURSOR_MAX_AGE_MS) {
+    if (logSinceTs && (Date.now() - logSinceTs.getTime()) > LOG_CURSOR_MAX_AGE_MS) {
       resetLogWindow();
     }
-    const lq = logSeq ? '?since_seq=' + logSeq : '';
+    const lq = logSince ? '?since=' + encodeURIComponent(logSince) : '';
     const [d, requestRows, credit, errSum] = await Promise.all([
       api('logs' + lq),
       api('request_logs?' + rq.toString()).catch(() => ({ entries: [] })),
@@ -1368,29 +1397,19 @@ async function loadLogs() {
     renderRequestMetrics(metrics, recent);
     // 增量合并到本地窗口（增量拉到的行 append；全量拉到的行 replace）。
     const incoming = d.entries || [];
-    if (logSeq) {
+    if (logSince) {
       logRows = logRows.concat(incoming);
       if (logRows.length > LOG_ROWS_MAX) logRows = logRows.slice(-LOG_ROWS_MAX);
     } else {
       logRows = incoming.slice(-LOG_ROWS_MAX);
     }
-    // 下次增量的起点：**服务端给的单调节号 seq**，不是时间戳。
-    //
-    // 时间戳在这里靠不住：入环 TS 是 time.Now()，同一时钟刻度内的多次写入完全相同
-    // （Windows 实测 ~15.6ms 粒度，一次 Write 的多行、背靠背的 Write 都会撞）。
-    // 按「最后一条的 ts」推进游标时，同一刻度里排在它后面（或就是它自己）的行
-    // 永远满足「晚于 since」，于是每轮轮询都重复返回一次、游标再也不前进——
-    // 面板「运行日志」底部那行反复刷出来。JS 的 Date 还只有毫秒，把原始串换成
-    // Date 往返只会让重复更严重。
-    // seq 是环内单调递增的（淘汰不回退），`seq > logSeq` 精确表达「还有哪些没给过」。
+    // 下次增量的起点：本次收到的最后一条的时间戳（同毫秒的多条会被一起带上，
+    // 重复无害——服务端按 After(since) 过滤，同毫秒条目可能重复一次；用
+    // 「已见过的最大 ts」而不是「现在」是对的：不能漏）。
     for (const e of incoming) {
-      if (e && typeof e.seq === 'number' && e.seq > logSeq) logSeq = e.seq;
+      if (e && e.ts && (!logSinceTs || new Date(e.ts) > logSinceTs)) logSinceTs = new Date(e.ts);
     }
-    // logCursorAt 记的是「上次成功同步的时刻」，不是「上次出现新行的时刻」：
-    // 老化判断要回答的是「我离开多久没跟了」，与有没有新日志无关。空闲时也刷新，
-    // 否则静默期每 5 分钟就会误触发一次全量拉（90KB 白拉）。真正切走很久再回来时
-    // 轮询本来就停了，这里的值会自然变旧，届时照旧回落全量。
-    logCursorAt = new Date();
+    logSince = logSinceTs ? logSinceTs.toISOString() : '';
     const entries = logRows.filter(e => logCh === 'all' || e.ch === logCh);
     setHTML(box, entries.length
       ? entries.map(e => {
@@ -1527,7 +1546,7 @@ function reqMatch(e, f) {
   f = f || reqFilter;
   if (f.outcome && String(e && e.outcome || '') !== f.outcome) return false;
   if (f.q) {
-    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.account, e && e.request_id]
+    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.model_eff, e && e.account, e && e.request_id]
       .filter(Boolean).join(' ').toLowerCase();
     for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
       if (!text.includes(kw)) return false;
@@ -1557,6 +1576,15 @@ function reqCreditCell(e) {
   return Number.isFinite(v) ? trimFixed(v.toFixed(2)) : '<span class="muted">—</span>';
 }
 
+/* reqModelText 请求记录模型列：请求模型与降级后实际模型是两个不同模型（计价/能力
+   都不同，2026-10-25 实案），显示成 requested->effective；未降级保持单值旧格式。 */
+function reqModelText(e) {
+  const m = e && e.model;
+  const eff = e && e.model_eff;
+  if (!m) return '—';
+  return eff && eff !== m ? m + '->' + eff : m;
+}
+
 /* renderRequestTable 渲染请求记录表。来源列是这一版的重点：IP 用等宽字体方便扫，
    UA 单行截断（完整值在 title 里，行本身用 requestLogText 作 tooltip）。 */
 function renderRequestTable() {
@@ -1571,7 +1599,7 @@ function renderRequestTable() {
     return '<tr title="' + esc(requestLogText(e)) + '">' +
       '<td class="num">' + esc(when) + '</td>' +
       '<td>' + reqOutcomeTag(e) + '</td>' +
-      '<td>' + esc(e && e.model || '—') + '</td>' +
+      '<td>' + esc(reqModelText(e)) + '</td>' +
       '<td>' + esc(e && e.account || '—') + '</td>' +
       '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '<td>' + (ua ? '<span class="clip" title="' + esc(ua) + '">' + esc(ua) + '</span>' : '<span class="muted">—</span>') + '</td>' +
@@ -1627,6 +1655,7 @@ function requestLogText(e) {
     when,
     String(e && e.status || '—') + ' ' + (outcomeLabel[e && e.outcome] || (e && e.outcome) || '—'),
     e && e.model || '—',
+    (e && e.model_eff && e.model_eff !== e.model) ? '⤳ ' + e.model_eff : '',
     e && e.account || '—',
     e && e.client_ip || '—',
     e && e.user_agent || '—',
@@ -1704,8 +1733,8 @@ const CFG_MAP = {
   models_allowed: ['models', 'allowed'],
   models_aliases: ['models', 'aliases'],
   thinking_enabled: ['thinking', 'enabled'],
-  cn_chat_base: ['cn', 'chat_base'], cn_billing_base: ['cn', 'billing_base'],
-  global_chat_base: ['global', 'chat_base'], global_billing_base: ['global', 'billing_base'],
+  model_fallback: ['pool', 'model_fallback'],
+  model_unavailable_fallback: ['pool', 'model_unavailable_fallback'],
 };
 /* 「覆盖型」文本字段：空串本身是有意义的取值（= 回落到内置默认），必须照发。
  *
@@ -1718,13 +1747,39 @@ const CFG_MAP = {
  * 刻意不含 api_key：清空它 = 关闭整个鉴权，误触代价是网关变成无鉴权公开服务。
  * 该字段（以及提示文案"留空 = 不鉴权"与现状不符的问题）单独处理。
  */
-const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file', 'cn_chat_base', 'cn_billing_base', 'global_chat_base', 'global_billing_base']);
+const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file']);
 
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
   let o = obj;
   for (let i = 0; i < path.length - 1; i++) { if (typeof o[path[i]] !== 'object' || o[path[i]] === null) o[path[i]] = {}; o = o[path[i]]; }
   o[path[path.length - 1]] = val;
+}
+
+/* 模型降级/兜底路由表（pool.model_fallback / pool.model_unavailable_fallback）：
+   配置端是 {源模型: 目标模型} 对象，表单端用 textarea 每行一条「源模型=目标模型」
+   （支持 cn:/global: 前缀）。空 textarea = 显式清空整表（与列表字段同语义）。
+   非法行（缺「=」或键/值为空）parseFallbackText 返回 null，由 onsubmit 拦截。 */
+const FALLBACK_FIELDS = ['model_fallback', 'model_unavailable_fallback'];
+const FALLBACK_TIP = '每行需为「源模型=目标模型」，例如 deepseek-v4.1-flash=deepseek-v4-flash';
+function fallbackToText(obj) {
+  if (!obj || typeof obj !== 'object') return '';
+  return Object.entries(obj).map(([k, v]) => k + '=' + v).join('\n');
+}
+function parseFallbackText(raw) {
+  const out = {};
+  for (const line of raw.split(/\n+/)) {
+    const t = line.trim();
+    if (!t) continue;
+    const eq = t.indexOf('=');
+    if (eq <= 0 || eq === t.length - 1) return null;
+    out[t.slice(0, eq).trim()] = t.slice(eq + 1).trim();
+  }
+  return out;
+}
+function fallbackBad(name) {
+  const el = $('cfgForm').elements[name];
+  return !!el && parseFallbackText(el.value) === null;
 }
 
 async function loadConfig() {
@@ -1737,6 +1792,7 @@ async function loadConfig() {
     for (const [name, path] of Object.entries(CFG_MAP)) {
       const el = f.elements[name];
       if (!el) continue;
+      if (FALLBACK_FIELDS.includes(name)) continue; // 路由表对象在循环后按行渲染
       el.disabled = managed.includes(path.join('.'));
       el.title = el.disabled ? '此项由启动环境变量设置，请在部署配置中修改。' : '';
       const v = dig(cfgLoaded, path);
@@ -1745,6 +1801,10 @@ async function loadConfig() {
       // 按模型覆盖档位（对象）：回显成「模型=档位」多行文本，与 textarea 输入同形。
       else if (v && typeof v === 'object') el.value = Object.entries(v).map(([k, x]) => k + '=' + x).join('\n');
       else el.value = v == null ? '' : v;
+    }
+    for (const name of FALLBACK_FIELDS) {
+      const el = f.elements[name];
+      if (el) el.value = fallbackToText(dig(cfgLoaded, CFG_MAP[name]));
     }
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
     // 思考档位策略是「三选一单选组」（客户端优先 / 网关优先·只档位 / 网关优先·档位+开关），
@@ -1772,6 +1832,7 @@ function collectConfig() {
   for (const [name, path] of Object.entries(CFG_MAP)) {
     const el = f.elements[name];
     if (!el) continue;
+    if (FALLBACK_FIELDS.includes(name)) continue; // 路由表对象在循环后按行解析
     let v;
     if (el.type === 'checkbox') v = el.checked;
     else if (el.type === 'number') { v = el.value.trim() === '' ? undefined : Number(el.value); }
@@ -1795,6 +1856,13 @@ function collectConfig() {
   const mode = modeEl ? modeEl.value : 'client';
   put(out, ['thinking', 'client_priority'], mode === 'client');
   put(out, ['thinking', 'override_scope'], mode === 'all' ? 'all' : 'level');
+  for (const name of FALLBACK_FIELDS) {
+    const el = f.elements[name];
+    if (!el) continue;
+    const parsed = parseFallbackText(el.value);
+    if (parsed === null) continue; // 非法行由 onsubmit 拦截，不把坏值发给后端
+    put(out, CFG_MAP[name], parsed); // 空 textarea = {} 照发（显式清空整表）
+  }
   return out;
 }
 /* Go 时长字段即时校验：空 = 沿用现值（collectConfig 跳过发送）；非空必须是
@@ -1831,28 +1899,6 @@ $('btnEye').onclick = () => {
   $('btnEye').textContent = show ? '隐藏' : '显示';
 };
 $('btnCfgReload').onclick = loadConfig;
-// cfgRealmFilter 配置页分域切换：all 显示全部；cn/global 仅显示该域专属字段
-// （data-realm 标记）。共享配置（无 data-realm）始终显示。保存时仍回传整份配置，
-// 故切换仅控制可见性、不丢字段。域名 base 等各域独立配置由此分开关，与账号池
-// 已有的 accRealmTabs 同构。
-let cfgRealmFilter = 'all';
-function applyCfgRealmFilter() {
-  document.querySelectorAll('#cfgForm [data-realm]').forEach(el => {
-    const r = el.getAttribute('data-realm');
-    el.style.display = (cfgRealmFilter === 'all' || cfgRealmFilter === r) ? '' : 'none';
-  });
-  const tabs = $('cfgRealmTabs');
-  if (tabs) tabs.querySelectorAll('button[data-realm]').forEach(b => b.classList.toggle('on', b.dataset.realm === cfgRealmFilter));
-}
-if ($('cfgRealmTabs')) {
-  $('cfgRealmTabs').addEventListener('click', ev => {
-    const btn = ev.target.closest('button[data-realm]');
-    if (!btn) return;
-    cfgRealmFilter = btn.dataset.realm;
-    applyCfgRealmFilter();
-  });
-  applyCfgRealmFilter();
-}
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();
   // 时长字段脏值拦截：标红 + toast 点名，不发保存请求（后端同样会拒，这里前置）。
@@ -1862,6 +1908,14 @@ $('cfgForm').onsubmit = async ev => {
     const el = $('cfgForm').elements[firstBad];
     el.focus();
     toast('「' + (el.closest('.fld')?.querySelector('.lb')?.textContent || firstBad) + '」' + DURATION_TIP, 'err');
+    return;
+  }
+  // 路由表非法行拦截：缺「=」或键/值为空的行不发保存请求（后端无法表达该形态）。
+  const firstBadFb = FALLBACK_FIELDS.find(fallbackBad);
+  if (firstBadFb) {
+    const el = $('cfgForm').elements[firstBadFb];
+    el.focus();
+    toast('「' + (el.closest('.fld')?.querySelector('.lb')?.textContent || firstBadFb) + '」' + FALLBACK_TIP, 'err');
     return;
   }
   const btn = $('btnCfgSave');
@@ -3757,9 +3811,6 @@ function renderExpirySnapshot(d) {
   }
   const dayTotals = [...dayMap.values()].sort((x, y) =>
     (x.date < y.date ? -1 : x.date > y.date ? 1 : 0) || (x.realm < y.realm ? -1 : 1));
-  if ($('expTotalNote')) {
-    $('expTotalNote').textContent = dayTotals.length ? dayTotals.length + ' 个到期日' : '暂无';
-  }
   $('expTotalBody').innerHTML = dayTotals.map(t => {
     const days = expDayDiff(t.date);
     return '<tr><td>' + esc(t.date) +
@@ -4990,7 +5041,10 @@ function populateEventFilterOptions(list) {
   const models = new Set();
   const accts = new Set();
   list.forEach(e => {
+    // 降级时请求模型与实际模型不同（model_eff）：两个都要进筛选项，否则按
+    // flash-sg 筛不到「实际跑在 flash-sg 上」的那些请求（它们 model 是 flash）。
     if (e.model) models.add(e.model);
+    if (e.model_eff && e.model_eff !== e.model) models.add(e.model_eff);
     if (e.account) accts.add(e.account);
   });
 
@@ -5011,7 +5065,9 @@ function renderEventTable() {
   const statusFilter = ($('eventFilterStatus') && $('eventFilterStatus').value) || '';
 
   let filtered = rawEventsData.filter(e => {
-    if (modelFilter && e.model !== modelFilter) return false;
+    // 模型筛选同时匹配请求模型与降级后实际模型：请求 A 实际用 B 成功时，按 B 筛
+    // 必须能筛到（与「模型与档位」页的 recent 匹配口径一致）。
+    if (modelFilter && e.model !== modelFilter && e.model_eff !== modelFilter) return false;
     if (acctFilter && e.account !== acctFilter) return false;
     if (statusFilter === 'success' && !(e.ok || (e.status >= 200 && e.status < 300))) return false;
     if (statusFilter === '429' && e.status !== 429) return false;
@@ -5035,10 +5091,12 @@ function renderEventTable() {
     const acctRaw = e.account || '-';
     const acctClean = acctRaw.replace(/\([^)]*\)/, '');
     const mName = e.model || '-';
-    const effort = e.reasoning_effort || '';
-    // 旧归档行没有这个键（不知道客户端发了什么）；新行恒有（空串 = 确认没发）。
-    const hasEffortReq = 'reasoning_effort_requested' in e;
-    const effortReq = e.reasoning_effort_requested || '';
+    // 降级（pool.model_fallback / model_unavailable_fallback）：请求模型与实际模型
+    // 是两个不同模型，计价/能力都不同。只显示请求模型会让「已经切到 flash-sg 并按
+    // 积分计费」的事件看起来还在跑 flash（2026-10-31 用户反馈）。与请求记录页同口径：
+    // 请求模型 + ⤳ 实际模型 两行，两端都可辨。
+    const mEff = e.model_eff && e.model_eff !== mName ? e.model_eff : '';
+    const effort = e.reasoning_effort || '-';
 
     let resTag = '<span class="tag-badge tag-success">成功</span>';
     if (e.status === 429) {
@@ -5076,8 +5134,10 @@ function renderEventTable() {
     return '<tr data-ev="' + i + '"' + (e.context ? ' title="点击查看请求上下文"' : '') + '>' +
       '<td class="time-cell"><div class="t-time">' + esc(tStr) + '</div><div class="t-date">' + esc(dStr) + '</div></td>' +
       '<td><div class="acct-cell"><span class="acct-icon"></span><span title="' + esc(acctRaw) + '">' + esc(acctClean) + '</span></div></td>' +
-      '<td class="model-cell"><div class="m-name">' + esc(mName) + '</div></td>' +
-      '<td>' + eventEffortPill(effort, effortReq, hasEffortReq) + '</td>' +
+      '<td class="model-cell"><div class="m-name">' + esc(mName) + '</div>' +
+        (mEff ? '<div class="m-eff" title="已降级：' + esc(mName) + ' → ' + esc(mEff) + '">⤳ ' + esc(mEff) + '</div>' : '') +
+      '</td>' +
+      '<td><span class="pill-effort">' + esc(effort) + '</span></td>' +
       '<td>' + resTag + '</td>' +
       '<td><span class="req-tag">' + esc(reqProto) + '</span><div class="req-path-sub">' + esc(reqPath) + '</div></td>' +
       '<td><div class="metric-main">' + esc(durSec) + '</div><div class="metric-sub">' + esc(ttfbSec) + '</div></td>' +
@@ -5091,21 +5151,6 @@ function renderEventTable() {
   }).join('');
 
   setHTML(tb, html);
-}
-
-// eventEffortPill 事件页「推理强度」列：「客户端要的」→「网关实际发出去的」两段显示。
-// 网关会在客户端没带档位时补模型默认档（thinking 默认档）、按策略改写或就近降级；
-// 只显示生效值时整列都是 max，看不出这一档是谁定的（与聊天行日志的
-// effort=max->high / effort=- ->max 同一口径）。
-//   - 一致：max；不一致（改写/降级）：high→max；客户端没发（网关补默认档）：-→max；都没有：-
-//   - hasReq=false 是升级前的老归档行（没有这个键），按旧口径只显示生效值，不臆测。
-function eventEffortPill(eff, req, hasReq) {
-  if (!hasReq) return '<span class="pill-effort">' + esc(eff || '-') + '</span>';
-  if (!eff && !req) return '<span class="pill-effort">-</span>';
-  if (!req) return '<span class="pill-effort" title="客户端未携带思考档位，这是网关补的默认档">-→' + esc(eff) + '</span>';
-  if (!eff) return '<span class="pill-effort" title="客户端要求关闭思考，或该档位模型不支持">' + esc(req) + '</span>';
-  if (req === eff) return '<span class="pill-effort">' + esc(eff) + '</span>';
-  return '<span class="pill-effort" title="左：客户端请求；右：网关实际发送">' + esc(req) + '→' + esc(eff) + '</span>';
 }
 
 // renderEventContext 把一次请求的会话上下文渲染成「角色 + 原文」块。
